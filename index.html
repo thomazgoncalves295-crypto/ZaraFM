@@ -207,6 +207,8 @@
 
         #scannerVideoWrap { position: relative; }
         #scannerVideo { width: 100%; border-radius: 16px; background: #000; display: block; }
+        #scannerOverlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; border-radius: 16px; }
+        #scannerHint { font-size: 0.85rem; font-weight: 600; margin-top: 8px; min-height: 1.2em; }
 
 
         .settings-panel { background: rgba(70,44,38,0.06); padding: 12px; border-radius: 14px; margin-bottom: 15px; display: none; text-align: left; }
@@ -252,7 +254,7 @@
                     <span>Escanear Fluffytag</span>
                 </button>
 
-                <button id="earCodeBtn" class="btn-share" title="Criar ZaraCode (Orelhas)">
+                <button id="earCodeBtn" class="btn-share" title="Criar ZaraCode">
                     <svg viewBox="0 0 24 24"><path d="M12 3c-4.97 0-9 4.03-9 9 0 2.12.74 4.07 1.97 5.61L4 20l2.39-1.03C7.93 20.26 9.88 21 12 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm0 16c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>
                     <span>ZaraCode</span>
                 </button>
@@ -328,13 +330,13 @@
     <div id="earCodeModal" class="modal-overlay" style="display:none;">
         <div class="modal-content">
             <div class="modal-header">
-                <h2>🐱 ZaraCode (Orelhas)</h2>
+                <h2>🐱 ZaraCode</h2>
             </div>
-            
+
             <input type="text" id="earSearchInput" class="input-pedido" placeholder="🔍 Buscar música (iTunes)...">
             <div id="earSearchResults" class="search-results"></div>
 
-            <canvas id="earCanvas" class="card-preview" width="300" height="480"></canvas>
+            <canvas id="earCanvas" class="card-preview" width="900" height="1680" style="width: 300px;"></canvas>
             
             <button id="downloadEarBtn" class="btn-share" style="width: 100%; justify-content: center; margin-bottom: 10px; display: none;">
                 <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
@@ -352,7 +354,11 @@
             <p id="scannerModalText" style="font-size: 0.9rem; margin-bottom: 15px;">Aponte a câmera ou envie uma foto:</p>
 
             <div id="scannerVideoWrap" style="display:none; margin-bottom: 12px;">
-                <video id="scannerVideo" autoplay playsinline muted></video>
+                <div style="position: relative;">
+                    <video id="scannerVideo" autoplay playsinline muted></video>
+                    <canvas id="scannerOverlay"></canvas>
+                </div>
+                <p id="scannerHint"></p>
             </div>
             <canvas id="scannerCaptureCanvas" style="display:none;"></canvas>
 
@@ -386,86 +392,707 @@
         </div>
     </div>
 
-    <div id="version-badge">v0.53 • Atualizado</div>
+    <div id="version-badge">v0.54 • Atualizado</div>
 
     <audio id="audioStream" preload="none" crossorigin="anonymous"></audio>
 
     <script>
-        var versaoLocalSite = "0.53";
+        /* =====================================================================
+         * ZaraCode v2 — código visual próprio da Zara FM (sem bibliotecas).
+         *
+         * Como funciona:
+         *  - 4 "olhos" (círculos concêntricos) nos cantos: o leitor acha cada um
+         *    em qualquer tamanho/rotação procurando o padrão escuro-claro-escuro-
+         *    claro-escuro na proporção 1:1:3:1:1 (vale em qualquer direção, pois
+         *    é um círculo).
+         *  - Com os 4 centros calcula-se a perspectiva (homografia) do card.
+         *  - 88 pontinhos (escuro = 1, vazio = 0) guardam 11 bytes:
+         *    5 bytes de dados (versão + trackId de 36 bits) + 6 bytes de
+         *    correção Reed-Solomon (corrige até 3 bytes errados).
+         *  - Lê por CLARO/ESCURO (luminância), nunca por cor: funciona com
+         *    câmera, luz quente, tela, foto impressa, etc.
+         * ===================================================================== */
+        var ZaraCode = (function () {
+            'use strict';
+
+            // ---------- Geometria (em "módulos") ----------
+            var D = 22;                    // distância entre os centros dos olhos
+            var R_IN = 1.5, R_MID = 2.5, R_OUT = 3.5; // disco escuro / anel claro / anel escuro
+            var DOT_R = 0.65;              // raio dos pontinhos de dados
+            var MARGIN = 1.5;              // margem branca fora dos olhos
+            var EXT = R_OUT + MARGIN;      // painel vai de -EXT até D+EXT
+            var SPAN = D + 2 * EXT;        // 32 módulos de largura
+            var EAR_H = 5.9;               // altura das orelhas acima do painel
+            var C = D / 2;
+
+            var VERSION = 0xA;
+            var N_DATA = 5, N_ECC = 6, N_TOTAL = 11;
+            var MAX_ID = 68719476735;      // 2^36 - 1
+
+            var COLORS = {
+                ink: '#462c26',
+                panel: '#fffaf6',
+                zero: '#f6dcd9',
+                innerEar: '#f4b6b0',
+                nose: '#f4b6b0'
+            };
+
+            var CORNERS = [[0, 0], [D, 0], [D, D], [0, D]];
+
+            // ---------- Posições dos pontinhos ----------
+            var POS = (function () {
+                var pts = [];
+                for (var y = 1; y < D; y += 2) {
+                    for (var x = 1; x < D; x += 2) {
+                        var nearEye = CORNERS.some(function (c) { return Math.hypot(x - c[0], y - c[1]) < 5.2; });
+                        var nearLogo = Math.hypot(x - C, y - C) < 3.2;
+                        if (!nearEye && !nearLogo) pts.push({ x: x, y: y });
+                    }
+                }
+                // Cada byte vira um bloquinho compacto (2 linhas x 4 colunas): um
+                // reflexo ou mancha localizada estraga poucos bytes, e o
+                // Reed-Solomon conserta.
+                pts.sort(function (a, b) {
+                    var ba = Math.floor((a.y - 1) / 4), bb = Math.floor((b.y - 1) / 4);
+                    return (ba - bb) || (a.x - b.x) || (a.y - b.y);
+                });
+                return pts;
+            })();
+            if (POS.length !== N_TOTAL * 8) throw new Error('ZaraCode: layout inválido (' + POS.length + ')');
+
+            // Máscara fixa: espalha os pontos para o desenho nunca ficar "vazio"
+            // ou "cheio" demais, seja qual for a música.
+            var MASK = (function () {
+                var s = 0x5A12A, out = [];
+                for (var i = 0; i < POS.length; i++) {
+                    s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
+                    out.push((s >> 16) & 1);
+                }
+                return out;
+            })();
+
+            // 8 orientações possíveis (4 rotações x espelhado). Para cada uma,
+            // PERMS[t][j] = índice físico onde está o bit lógico j.
+            var PERMS = (function () {
+                var index = {};
+                POS.forEach(function (p, i) { index[p.x + ',' + p.y] = i; });
+                var perms = [];
+                for (var mirror = 0; mirror < 2; mirror++) {
+                    for (var rot = 0; rot < 4; rot++) {
+                        perms.push(POS.map(function (p) {
+                            var x = p.x, y = p.y, t;
+                            if (mirror) { t = x; x = y; y = t; }
+                            for (var r = 0; r < rot; r++) { t = x; x = D - y; y = t; }
+                            return index[x + ',' + y];
+                        }));
+                    }
+                }
+                return perms;
+            })();
+
+            // ---------- Reed-Solomon em GF(256) ----------
+            var EXP = new Uint8Array(512), LOG = new Uint8Array(256);
+            (function () {
+                var x = 1;
+                for (var i = 0; i < 255; i++) {
+                    EXP[i] = x; LOG[x] = i;
+                    x <<= 1; if (x & 0x100) x ^= 0x11d;
+                }
+                for (i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+            })();
+            function gmul(a, b) { return (a && b) ? EXP[LOG[a] + LOG[b]] : 0; }
+            function ginv(a) { return EXP[255 - LOG[a]]; }
+
+            var GEN = (function () {
+                var g = [1];
+                for (var j = 0; j < N_ECC; j++) {
+                    var ng = new Array(g.length + 1).fill(0);
+                    for (var i = 0; i < g.length; i++) { ng[i] ^= g[i]; ng[i + 1] ^= gmul(g[i], EXP[j]); }
+                    g = ng;
+                }
+                return g;
+            })();
+
+            function rsEncode(msg) {
+                var buf = msg.concat(new Array(N_ECC).fill(0));
+                for (var i = 0; i < msg.length; i++) {
+                    var coef = buf[i];
+                    if (coef) for (var j = 1; j < GEN.length; j++) buf[i + j] ^= gmul(GEN[j], coef);
+                }
+                return msg.concat(buf.slice(msg.length));
+            }
+
+            function syndromes(r) {
+                var S = [], any = false;
+                for (var j = 0; j < N_ECC; j++) {
+                    var v = 0, a = EXP[j];
+                    for (var i = 0; i < r.length; i++) v = gmul(v, a) ^ r[i];
+                    S.push(v); if (v) any = true;
+                }
+                return any ? S : null;
+            }
+
+            // Resolve A·x = b em GF(256) (eliminação de Gauss).
+            function solveGF(A, b) {
+                var n = b.length, M = A.map(function (row, i) { return row.concat([b[i]]); });
+                for (var col = 0; col < n; col++) {
+                    var piv = -1;
+                    for (var r = col; r < n; r++) if (M[r][col]) { piv = r; break; }
+                    if (piv < 0) return null;
+                    var tmp = M[col]; M[col] = M[piv]; M[piv] = tmp;
+                    var inv = ginv(M[col][col]);
+                    for (var c = col; c <= n; c++) M[col][c] = gmul(M[col][c], inv);
+                    for (var r2 = 0; r2 < n; r2++) {
+                        if (r2 === col || !M[r2][col]) continue;
+                        var f = M[r2][col];
+                        for (var c2 = col; c2 <= n; c2++) M[r2][c2] ^= gmul(f, M[col][c2]);
+                    }
+                }
+                return M.map(function (row) { return row[n]; });
+            }
+
+            // Decodificação por busca das posições de erro (o código é pequeno:
+            // 11 bytes, então testar todas as combinações de até 3 posições é
+            // rápido e fácil de conferir). Sempre devolve a correção de menor peso.
+            function rsDecode(r, maxErr) {
+                var n = r.length, S = syndromes(r);
+                if (!S) return { bytes: r.slice(0, n - N_ECC), errors: 0 };
+                var X = []; // localizador de cada posição
+                for (var p = 0; p < n; p++) X.push(EXP[(n - 1 - p) % 255]);
+
+                for (var w = 1; w <= maxErr; w++) {
+                    var idx = [];
+                    for (var k = 0; k < w; k++) idx.push(k);
+                    while (true) {
+                        var A = [], b = [];
+                        for (var j = 0; j < w; j++) {
+                            A.push(idx.map(function (pp) { var v = 1; for (var q = 0; q < j; q++) v = gmul(v, X[pp]); return v; }));
+                            b.push(S[j]);
+                        }
+                        var e = solveGF(A, b);
+                        if (e && e.every(function (v) { return v !== 0; })) {
+                            var ok = true;
+                            for (var j2 = w; j2 < N_ECC && ok; j2++) {
+                                var s = 0;
+                                for (var k2 = 0; k2 < w; k2++) {
+                                    var xp = 1; for (var q2 = 0; q2 < j2; q2++) xp = gmul(xp, X[idx[k2]]);
+                                    s ^= gmul(e[k2], xp);
+                                }
+                                if (s !== S[j2]) ok = false;
+                            }
+                            if (ok) {
+                                var fixed = r.slice();
+                                for (var k3 = 0; k3 < w; k3++) fixed[idx[k3]] ^= e[k3];
+                                return { bytes: fixed.slice(0, n - N_ECC), errors: w };
+                            }
+                        }
+                        // próxima combinação
+                        var t = w - 1;
+                        while (t >= 0 && idx[t] === n - w + t) t--;
+                        if (t < 0) break;
+                        idx[t]++;
+                        for (var u = t + 1; u < w; u++) idx[u] = idx[u - 1] + 1;
+                    }
+                }
+                return null;
+            }
+
+            // ---------- Bits <-> trackId ----------
+            function encodeBits(id) {
+                id = Math.floor(Number(id));
+                if (!(id > 0 && id <= MAX_ID)) throw new Error('ZaraCode: trackId inválido');
+                var hi = Math.floor(id / 4294967296), lo = id % 4294967296;
+                var data = [(VERSION << 4) | hi, (lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255];
+                var bytes = rsEncode(data), bits = [];
+                for (var i = 0; i < bytes.length; i++) {
+                    for (var k = 7; k >= 0; k--) bits.push(((bytes[i] >> k) & 1) ^ MASK[bits.length]);
+                }
+                return bits;
+            }
+
+            function decodeBits(bits, maxErr) {
+                var bytes = [];
+                for (var i = 0; i < N_TOTAL; i++) {
+                    var v = 0;
+                    for (var k = 0; k < 8; k++) v = (v << 1) | (bits[i * 8 + k] ^ MASK[i * 8 + k]);
+                    bytes.push(v);
+                }
+                var res = rsDecode(bytes, maxErr);
+                if (!res) return null;
+                var d = res.bytes;
+                if ((d[0] >> 4) !== VERSION) return null;
+                var id = (d[0] & 0x0F) * 4294967296 + (((d[1] << 24) | (d[2] << 16) | (d[3] << 8) | d[4]) >>> 0);
+                if (!id) return null;
+                return { id: id, errors: res.errors };
+            }
+
+            // ---------- Desenho ----------
+            // Desenha o painel (com orelhas) com o canto superior esquerdo do
+            // quadrado em (left, top) e largura `size`. As orelhas sobem
+            // size * ZaraCode.EAR_RATIO acima de `top`.
+            function draw(ctx, left, top, size, trackId) {
+                var bits = encodeBits(trackId);
+                var m = size / SPAN;
+                var ox = left + EXT * m, oy = top + EXT * m;
+                function X(x) { return ox + x * m; }
+                function Y(y) { return oy + y * m; }
+                function circle(x, y, r, color) {
+                    ctx.beginPath(); ctx.arc(X(x), Y(y), r * m, 0, Math.PI * 2);
+                    ctx.fillStyle = color; ctx.fill();
+                }
+                function earPath(sign, inner) {
+                    // sign = +1 orelha esquerda, -1 direita (espelhada em x = C)
+                    function px(x) { return X(sign > 0 ? x : D - x); }
+                    ctx.beginPath();
+                    if (!inner) {
+                        ctx.moveTo(px(-4.95), Y(-1.4));
+                        ctx.quadraticCurveTo(px(-5.7), Y(-7.0), px(-3.7), Y(-10.0));
+                        ctx.quadraticCurveTo(px(-3.0), Y(-10.9), px(-2.0), Y(-10.3));
+                        ctx.quadraticCurveTo(px(3.2), Y(-7.9), px(8.6), Y(-4.95));
+                    } else {
+                        ctx.moveTo(px(-3.9), Y(-5.7));
+                        ctx.quadraticCurveTo(px(-4.3), Y(-8.3), px(-3.1), Y(-9.3));
+                        ctx.quadraticCurveTo(px(1.2), Y(-7.8), px(5.6), Y(-5.7));
+                    }
+                    ctx.closePath();
+                }
+                function panelPath() {
+                    var x0 = X(-EXT), y0 = Y(-EXT), s = SPAN * m, r = 4.2 * m;
+                    ctx.beginPath();
+                    ctx.moveTo(x0 + r, y0); ctx.lineTo(x0 + s - r, y0);
+                    ctx.quadraticCurveTo(x0 + s, y0, x0 + s, y0 + r); ctx.lineTo(x0 + s, y0 + s - r);
+                    ctx.quadraticCurveTo(x0 + s, y0 + s, x0 + s - r, y0 + s); ctx.lineTo(x0 + r, y0 + s);
+                    ctx.quadraticCurveTo(x0, y0 + s, x0, y0 + s - r); ctx.lineTo(x0, y0 + r);
+                    ctx.quadraticCurveTo(x0, y0, x0 + r, y0);
+                    ctx.closePath();
+                }
+
+                ctx.save();
+                ctx.lineJoin = 'round';
+                // Sombra suave por baixo do painel
+                ctx.fillStyle = COLORS.panel;
+                ctx.shadowColor = 'rgba(70,44,38,0.22)'; ctx.shadowBlur = 1.4 * m; ctx.shadowOffsetY = 0.5 * m;
+                panelPath(); ctx.fill();
+                ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+                // Contorno (orelhas + painel) por fora, estilo adesivo.
+                ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.6 * m;
+                earPath(1, false); ctx.stroke();
+                earPath(-1, false); ctx.stroke();
+                panelPath(); ctx.stroke();
+                earPath(1, false); ctx.fill();
+                earPath(-1, false); ctx.fill();
+                panelPath(); ctx.fill();
+                ctx.fillStyle = COLORS.innerEar;
+                earPath(1, true); ctx.fill();
+                earPath(-1, true); ctx.fill();
+
+                // Olhos de leitura (os 4 cantos)
+                CORNERS.forEach(function (c) {
+                    circle(c[0], c[1], R_OUT, COLORS.ink);
+                    circle(c[0], c[1], R_MID, COLORS.panel);
+                    circle(c[0], c[1], R_IN, COLORS.ink);
+                });
+
+                // Dados
+                for (var i = 0; i < POS.length; i++) {
+                    if (bits[i]) circle(POS[i].x, POS[i].y, DOT_R, COLORS.ink);
+                    else circle(POS[i].x, POS[i].y, 0.22, COLORS.zero);
+                }
+
+                // Gatinho no centro (indica o "lado de cima" para as pessoas;
+                // o leitor não precisa dele: lê em qualquer rotação)
+                ctx.fillStyle = COLORS.ink;
+                ctx.beginPath();
+                ctx.moveTo(X(C - 2.15), Y(C - 0.2)); ctx.lineTo(X(C - 1.75), Y(C - 2.55)); ctx.lineTo(X(C - 0.55), Y(C - 1.55)); ctx.closePath(); ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(X(C + 2.15), Y(C - 0.2)); ctx.lineTo(X(C + 1.75), Y(C - 2.55)); ctx.lineTo(X(C + 0.55), Y(C - 1.55)); ctx.closePath(); ctx.fill();
+                ctx.beginPath(); ctx.ellipse(X(C), Y(C + 0.35), 2.3 * m, 1.95 * m, 0, 0, Math.PI * 2); ctx.fill();
+                circle(C - 0.85, C + 0.05, 0.36, COLORS.panel);
+                circle(C + 0.85, C + 0.05, 0.36, COLORS.panel);
+                ctx.beginPath();
+                ctx.moveTo(X(C - 0.3), Y(C + 0.75)); ctx.lineTo(X(C + 0.3), Y(C + 0.75)); ctx.lineTo(X(C), Y(C + 1.1)); ctx.closePath();
+                ctx.fillStyle = COLORS.nose; ctx.fill();
+                ctx.restore();
+            }
+
+            // ---------- Leitura ----------
+            function toGray(rgba, W, H) {
+                var g = new Uint8Array(W * H);
+                for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (rgba[j] * 77 + rgba[j + 1] * 150 + rgba[j + 2] * 29) >> 8;
+                return g;
+            }
+
+            // Limiarização adaptativa (média local por imagem integral): aguenta
+            // sombra, degradê de luz e telas com brilho desigual.
+            function binarize(gray, W, H, half) {
+                var I = new Uint32Array((W + 1) * (H + 1));
+                for (var y = 0; y < H; y++) {
+                    var rowSum = 0;
+                    for (var x = 0; x < W; x++) {
+                        rowSum += gray[y * W + x];
+                        I[(y + 1) * (W + 1) + x + 1] = I[y * (W + 1) + x + 1] + rowSum;
+                    }
+                }
+                var bin = new Uint8Array(W * H);
+                for (var y2 = 0; y2 < H; y2++) {
+                    var ya = Math.max(0, y2 - half), yb = Math.min(H, y2 + half + 1);
+                    for (var x2 = 0; x2 < W; x2++) {
+                        var xa = Math.max(0, x2 - half), xb = Math.min(W, x2 + half + 1);
+                        var sum = I[yb * (W + 1) + xb] - I[ya * (W + 1) + xb] - I[yb * (W + 1) + xa] + I[ya * (W + 1) + xa];
+                        var count = (xb - xa) * (yb - ya);
+                        bin[y2 * W + x2] = (gray[y2 * W + x2] * count * 100 < sum * 85) ? 1 : 0;
+                    }
+                }
+                return bin;
+            }
+
+            function ratioOK(c, tol) {
+                var total = c[0] + c[1] + c[2] + c[3] + c[4];
+                if (total < 7) return false;
+                var m = total / 7, v = m * tol;
+                return Math.abs(m - c[0]) < v && Math.abs(m - c[1]) < v && Math.abs(3 * m - c[2]) < 3 * v &&
+                    Math.abs(m - c[3]) < v && Math.abs(m - c[4]) < v;
+            }
+
+            // Percorre uma reta passando por (px,py) nos dois sentidos e mede as
+            // 5 faixas escuro/claro/escuro/claro/escuro.
+            function crossCheck(bin, W, H, px, py, dx, dy, maxRun, tol) {
+                if (px < 0 || py < 0 || px >= W || py >= H || !bin[py * W + px]) return null;
+                var c = [0, 0, 0, 0, 0], x, y, back, fwd;
+                function inside() { return x >= 0 && y >= 0 && x < W && y < H; }
+                x = px; y = py;
+                while (inside() && bin[y * W + x] && c[2] <= maxRun) { c[2]++; x -= dx; y -= dy; }
+                back = c[2];
+                while (inside() && !bin[y * W + x] && c[1] <= maxRun) { c[1]++; x -= dx; y -= dy; }
+                if (!inside() || !c[1] || c[1] > maxRun) return null;
+                while (inside() && bin[y * W + x] && c[0] <= maxRun) { c[0]++; x -= dx; y -= dy; }
+                if (c[0] > maxRun) return null;
+                x = px + dx; y = py + dy;
+                while (inside() && bin[y * W + x] && c[2] <= maxRun * 2) { c[2]++; x += dx; y += dy; }
+                fwd = c[2] - back;
+                while (inside() && !bin[y * W + x] && c[3] <= maxRun) { c[3]++; x += dx; y += dy; }
+                if (!inside() || !c[3] || c[3] > maxRun) return null;
+                while (inside() && bin[y * W + x] && c[4] <= maxRun) { c[4]++; x += dx; y += dy; }
+                if (c[4] > maxRun) return null;
+                if (!ratioOK(c, tol)) return null;
+                return { total: c[0] + c[1] + c[2] + c[3] + c[4], offset: (fwd - back + 1) / 2 };
+            }
+
+            function findEyes(bin, W, H) {
+                var eyes = [];
+                function add(x, y, m) {
+                    for (var i = 0; i < eyes.length; i++) {
+                        var e = eyes[i];
+                        if (Math.hypot(e.x - x, e.y - y) < 2 * Math.max(m, e.m) && m < e.m * 2 && e.m < m * 2) {
+                            var n = e.n + 1;
+                            e.x = (e.x * e.n + x) / n; e.y = (e.y * e.n + y) / n; e.m = (e.m * e.n + m) / n; e.n = n;
+                            return;
+                        }
+                    }
+                    eyes.push({ x: x, y: y, m: m, n: 1 });
+                }
+                var starts = new Int32Array(W + 1), lens = new Int32Array(W + 1);
+                for (var y = 0; y < H; y++) {
+                    var row = y * W, nRuns = 0, x = 0;
+                    var firstDark = bin[row];
+                    while (x < W) {
+                        var v = bin[row + x], s = x;
+                        while (x < W && bin[row + x] === v) x++;
+                        starts[nRuns] = s; lens[nRuns] = x - s; nRuns++;
+                    }
+                    for (var i = firstDark ? 0 : 1; i + 4 < nRuns; i += 2) {
+                        var c = [lens[i], lens[i + 1], lens[i + 2], lens[i + 3], lens[i + 4]];
+                        if (!ratioOK(c, 0.5)) continue;
+                        var totalH = c[0] + c[1] + c[2] + c[3] + c[4];
+                        var cx = starts[i + 2] + lens[i + 2] / 2;
+                        var px = Math.floor(cx);
+                        var vChk = crossCheck(bin, W, H, px, y, 0, 1, Math.ceil(totalH * 1.6), 0.5);
+                        if (!vChk) continue;
+                        var cy = y + 0.5 + vChk.offset, py = Math.floor(cy);
+                        var hChk = crossCheck(bin, W, H, px, py, 1, 0, Math.ceil(vChk.total * 1.6), 0.5);
+                        if (!hChk) continue;
+                        var cx2 = px + 0.5 + hChk.offset;
+                        var big = Math.ceil(Math.max(hChk.total, vChk.total) * 1.6);
+                        if (!crossCheck(bin, W, H, Math.floor(cx2), py, 1, 1, big, 0.75) &&
+                            !crossCheck(bin, W, H, Math.floor(cx2), py, 1, -1, big, 0.75)) continue;
+                        add(cx2, cy, (hChk.total + vChk.total) / 14);
+                    }
+                }
+                return eyes;
+            }
+
+            function homography(src, dst) {
+                var A = [], b = [];
+                for (var i = 0; i < 4; i++) {
+                    var x = src[i][0], y = src[i][1], u = dst[i].x, v = dst[i].y;
+                    A.push([x, y, 1, 0, 0, 0, -x * u, -y * u]); b.push(u);
+                    A.push([0, 0, 0, x, y, 1, -x * v, -y * v]); b.push(v);
+                }
+                for (var col = 0; col < 8; col++) {
+                    var piv = col;
+                    for (var r = col + 1; r < 8; r++) if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+                    var t = A[col]; A[col] = A[piv]; A[piv] = t; var tb = b[col]; b[col] = b[piv]; b[piv] = tb;
+                    if (Math.abs(A[col][col]) < 1e-12) return null;
+                    for (var r2 = 0; r2 < 8; r2++) {
+                        if (r2 === col) continue;
+                        var f = A[r2][col] / A[col][col];
+                        if (!f) continue;
+                        for (var c = col; c < 8; c++) A[r2][c] -= f * A[col][c];
+                        b[r2] -= f * b[col];
+                    }
+                }
+                var h = b.map(function (v, i) { return v / A[i][i]; });
+                return function (x, y) {
+                    var w = h[6] * x + h[7] * y + 1;
+                    return { x: (h[0] * x + h[1] * y + h[2]) / w, y: (h[3] * x + h[4] * y + h[5]) / w };
+                };
+            }
+
+            function sampleMean(gray, W, H, x, y, r) {
+                var x0 = Math.floor(x - r), x1 = Math.floor(x + r), y0 = Math.floor(y - r), y1 = Math.floor(y + r);
+                var s = 0, n = 0;
+                for (var yy = y0; yy <= y1; yy++) {
+                    if (yy < 0 || yy >= H) continue;
+                    for (var xx = x0; xx <= x1; xx++) {
+                        if (xx < 0 || xx >= W) continue;
+                        s += gray[yy * W + xx]; n++;
+                    }
+                }
+                return n ? s / n : -1;
+            }
+
+            function orderClockwise(pts) {
+                var cx = 0, cy = 0;
+                pts.forEach(function (p) { cx += p.x / 4; cy += p.y / 4; });
+                return pts.slice().sort(function (a, b) { return Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx); });
+            }
+
+            function candidateQuads(eyes) {
+                var list = eyes.slice().sort(function (a, b) { return b.n - a.n; }).slice(0, 10);
+                var quads = [];
+                var L = list.length;
+                for (var a = 0; a < L; a++) for (var b = a + 1; b < L; b++) for (var c = b + 1; c < L; c++) for (var d = c + 1; d < L; d++) {
+                    var q = orderClockwise([list[a], list[b], list[c], list[d]]);
+                    var ms = q.map(function (p) { return p.m; });
+                    if (Math.max.apply(null, ms) > 2.6 * Math.min.apply(null, ms)) continue;
+                    var convex = true, score = 0;
+                    for (var i = 0; i < 4; i++) {
+                        var p0 = q[i], p1 = q[(i + 1) % 4], p2 = q[(i + 2) % 4];
+                        var cr = (p1.x - p0.x) * (p2.y - p1.y) - (p1.y - p0.y) * (p2.x - p1.x);
+                        if (cr <= 0) { convex = false; break; }
+                        var side = Math.hypot(p1.x - p0.x, p1.y - p0.y) / ((p0.m + p1.m) / 2);
+                        if (side < D * 0.5 || side > D * 1.9) { convex = false; break; }
+                        score += Math.abs(Math.log(side / D));
+                    }
+                    if (!convex) continue;
+                    score -= 0.02 * (q[0].n + q[1].n + q[2].n + q[3].n) / 4;
+                    quads.push({ pts: q, score: score });
+                }
+                quads.sort(function (x, y) { return x.score - y.score; });
+                return quads.slice(0, 16).map(function (x) { return x.pts; });
+            }
+
+            // ---- Recuperação com 3 olhos (o 4º sumiu por reflexo, sombra, dedo...) ----
+            function bilinear(gray, W, H, x, y) {
+                x -= 0.5; y -= 0.5;
+                var x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+                if (x0 < 0 || y0 < 0 || x0 + 1 >= W || y0 + 1 >= H) return -1;
+                var i = y0 * W + x0;
+                return (gray[i] * (1 - fx) + gray[i + 1] * fx) * (1 - fy) + (gray[i + W] * (1 - fx) + gray[i + W + 1] * fx) * fy;
+            }
+            var EYE_TEMPLATE = (function () {
+                var t = [{ r: 0, a: 0, v: -1 }];
+                [[0.8, 6, -1], [2.0, 12, 1], [3.0, 12, -1], [4.3, 12, 1]].forEach(function (ring) {
+                    for (var k = 0; k < ring[1]; k++) t.push({ r: ring[0], a: (k + 0.5) * 2 * Math.PI / ring[1], v: ring[2] });
+                });
+                var mean = t.reduce(function (s, p) { return s + p.v; }, 0) / t.length;
+                var ss = 0;
+                t.forEach(function (p) { p.v -= mean; ss += p.v * p.v; });
+                t.norm = Math.sqrt(ss);
+                return t;
+            })();
+            // Correlação (NCC) entre a imagem e o desenho esperado de um olho
+            // centrado em (mx,my) — imune a brilho/contraste.
+            function eyeScore(gray, W, H, map, mx, my) {
+                var vals = [], s = 0;
+                for (var i = 0; i < EYE_TEMPLATE.length; i++) {
+                    var t = EYE_TEMPLATE[i], p = map(mx + t.r * Math.cos(t.a), my + t.r * Math.sin(t.a));
+                    var v = bilinear(gray, W, H, p.x, p.y);
+                    if (v < 0) return -1;
+                    vals.push(v); s += v;
+                }
+                var mean = s / vals.length, num = 0, den = 0;
+                for (var j = 0; j < vals.length; j++) { var d = vals[j] - mean; num += d * EYE_TEMPLATE[j].v; den += d * d; }
+                return den > 0 ? num / (Math.sqrt(den) * EYE_TEMPLATE.norm) : -1;
+            }
+            function findFourthEye(gray, W, H, quad) {
+                var map = homography(CORNERS, quad);
+                if (!map) return null;
+                var best = -1, bx = D, by = D;
+                for (var dy = -5; dy <= 5; dy += 0.5) for (var dx = -5; dx <= 5; dx += 0.5) {
+                    var sc = eyeScore(gray, W, H, map, D + dx, D + dy);
+                    if (sc > best) { best = sc; bx = D + dx; by = D + dy; }
+                }
+                var cx = bx, cy = by;
+                for (var dy2 = -0.5; dy2 <= 0.5; dy2 += 0.125) for (var dx2 = -0.5; dx2 <= 0.5; dx2 += 0.125) {
+                    var sc2 = eyeScore(gray, W, H, map, cx + dx2, cy + dy2);
+                    if (sc2 > best) { best = sc2; bx = cx + dx2; by = cy + dy2; }
+                }
+                if (best < 0.4) return null;
+                return map(bx, by);
+            }
+            function tripleQuads(eyes) {
+                var list = eyes.slice().sort(function (a, b) { return b.n - a.n; }).slice(0, 8);
+                var out = [];
+                for (var i = 0; i < list.length; i++) for (var j = 0; j < list.length; j++) for (var k = j + 1; k < list.length; k++) {
+                    if (i === j || i === k) continue;
+                    var B = list[i], A = list[j], Cc = list[k];
+                    var mA = (A.m + B.m) / 2, mC = (Cc.m + B.m) / 2;
+                    var la = Math.hypot(A.x - B.x, A.y - B.y), lc = Math.hypot(Cc.x - B.x, Cc.y - B.y);
+                    var sa = la / mA, sc = lc / mC;
+                    if (sa < D * 0.5 || sa > D * 1.9 || sc < D * 0.5 || sc > D * 1.9) continue;
+                    if (la > 2.2 * lc || lc > 2.2 * la) continue;
+                    var cos = ((A.x - B.x) * (Cc.x - B.x) + (A.y - B.y) * (Cc.y - B.y)) / (la * lc);
+                    if (Math.abs(cos) > 0.65) continue;
+                    var cross = (A.x - B.x) * (Cc.y - B.y) - (A.y - B.y) * (Cc.x - B.x);
+                    var first = cross > 0 ? A : Cc, last = cross > 0 ? Cc : A; // garante sentido horário
+                    var P = { x: A.x + Cc.x - B.x, y: A.y + Cc.y - B.y };
+                    out.push({ q: [B, first, P, last], score: Math.abs(Math.log(sa / D)) + Math.abs(Math.log(sc / D)) + Math.abs(cos) });
+                }
+                out.sort(function (a, b) { return a.score - b.score; });
+                return out.slice(0, 6).map(function (o) { return o.q; });
+            }
+
+            // Para cada pontinho, os "vãos" diagonais ao redor (sempre claros no
+            // desenho): servem para medir o branco local (reflexo, sombra).
+            var GAPS = POS.map(function (p) {
+                var g = [];
+                [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(function (o) {
+                    var x = p.x + o[0], y = p.y + o[1];
+                    var nearEye = CORNERS.some(function (c) { return Math.hypot(x - c[0], y - c[1]) < 4.3; });
+                    if (!nearEye && Math.hypot(x - C, y - C) > 3.4) g.push([x, y]);
+                });
+                return g;
+            });
+
+            function readQuad(gray, W, H, q, maxErr) {
+                var map = homography(CORNERS, q);
+                if (!map) return null;
+                function moduleAt(x, y) {
+                    var a = map(x - 0.5, y), b = map(x + 0.5, y), c = map(x, y - 0.5), d = map(x, y + 0.5);
+                    return Math.min(Math.hypot(b.x - a.x, b.y - a.y), Math.hypot(d.x - c.x, d.y - c.y));
+                }
+                function lumAt(x, y, rad) {
+                    var p = map(x, y);
+                    return sampleMean(gray, W, H, p.x, p.y, Math.max(0.5, rad * moduleAt(x, y)));
+                }
+                // Calibra o "escuro" e o "claro" em cada olho.
+                var thr = [], con = [], good = [];
+                for (var i = 0; i < 4; i++) {
+                    var cx = CORNERS[i][0], cy = CORNERS[i][1];
+                    var dark = lumAt(cx, cy, 0.6), lights = [];
+                    for (var k = 0; k < 12; k++) {
+                        var t = k * Math.PI / 6, v = lumAt(cx + 4.25 * Math.cos(t), cy + 4.25 * Math.sin(t), 0.3);
+                        if (v >= 0) lights.push(v);
+                    }
+                    if (dark < 0 || lights.length < 6) return null;
+                    lights.sort(function (x, y) { return x - y; });
+                    var light = lights[Math.floor(lights.length * 0.6)];
+                    thr.push((light + dark) / 2); con.push(light - dark); good.push(light - dark >= 20);
+                }
+                var nGood = good.filter(Boolean).length;
+                if (nGood < 2) return null;
+                if (nGood < 4) { // olho "lavado" por reflexo: usa a média dos bons
+                    var mt = 0, mc = 0;
+                    for (var g = 0; g < 4; g++) if (good[g]) { mt += thr[g] / nGood; mc += con[g] / nGood; }
+                    for (var g2 = 0; g2 < 4; g2++) if (!good[g2]) { thr[g2] = mt; con[g2] = mc; }
+                }
+                var lum = [], th = [], ct = [], wh = [];
+                for (var j = 0; j < POS.length; j++) {
+                    var u = POS[j].x / D, w = POS[j].y / D;
+                    var val = lumAt(POS[j].x, POS[j].y, 0.32);
+                    if (val < 0) return null;
+                    lum.push(val);
+                    th.push((1 - u) * (1 - w) * thr[0] + u * (1 - w) * thr[1] + u * w * thr[2] + (1 - u) * w * thr[3]);
+                    ct.push((1 - u) * (1 - w) * con[0] + u * (1 - w) * con[1] + u * w * con[2] + (1 - u) * w * con[3]);
+                    var white = -1;
+                    for (var gg = 0; gg < GAPS[j].length; gg++) white = Math.max(white, lumAt(GAPS[j][gg][0], GAPS[j][gg][1], 0.3));
+                    wh.push(white);
+                }
+                var modes = [
+                    function (j) { return th[j]; },                                            // limiar dos olhos
+                    function (j) { return wh[j] >= 0 ? wh[j] - 0.5 * ct[j] : th[j]; },          // branco local (reflexo)
+                    function (j) { return th[j] - 0.12 * ct[j]; },
+                    function (j) { return th[j] + 0.12 * ct[j]; }
+                ];
+                var best = null;
+                for (var mi = 0; mi < modes.length && !best; mi++) {
+                    var phys = lum.map(function (v, jj) { return v < modes[mi](jj) ? 1 : 0; });
+                    for (var t2 = 0; t2 < 8; t2++) {
+                        var perm = PERMS[t2];
+                        var res = decodeBits(perm.map(function (pi) { return phys[pi]; }), maxErr);
+                        if (res && (!best || res.errors < best.errors)) best = res;
+                    }
+                }
+                return best;
+            }
+
+            // img = { data: RGBA (Uint8ClampedArray), width, height }
+            // opts.maxErrors: bytes corrigíveis aceitos (câmera 2, foto 3)
+            function scan(img, opts) {
+                opts = opts || {};
+                var maxErr = opts.maxErrors == null ? 3 : opts.maxErrors;
+                var W = img.width, H = img.height;
+                var gray = toGray(img.data, W, H);
+                var out = { id: null, eyes: [], quad: null, errors: null };
+                var tried = {};
+                function attempt(quad) {
+                    var key = quad.map(function (p) { return Math.round(p.x) + ',' + Math.round(p.y); }).join(';');
+                    if (tried[key]) return false;
+                    tried[key] = 1;
+                    var res = readQuad(gray, W, H, quad, maxErr);
+                    if (res) { out.id = res.id; out.errors = res.errors; out.quad = quad; return true; }
+                    return false;
+                }
+                // 1ª passada: janela grande (códigos grandes/perto). 2ª: janela
+                // pequena (reflexo, sombra forte, código pequeno/longe).
+                var windows = [Math.max(W, H) / 14, Math.max(W, H) / 40];
+                for (var pass = 0; pass < windows.length; pass++) {
+                    var bin = binarize(gray, W, H, Math.max(6, Math.round(windows[pass])));
+                    findEyes(bin, W, H).forEach(function (e) {
+                        var dup = out.eyes.some(function (o) { return Math.hypot(o.x - e.x, o.y - e.y) < 2 * Math.max(o.m, e.m); });
+                        if (!dup) out.eyes.push(e);
+                    });
+                    var quads = candidateQuads(out.eyes);
+                    for (var i = 0; i < quads.length; i++) if (attempt(quads[i])) return out;
+                    // Só 3 olhos visíveis? Estima onde está o 4º e confirma pelo desenho.
+                    var triples = tripleQuads(out.eyes);
+                    for (var t = 0; t < triples.length; t++) {
+                        var q = triples[t], p4 = findFourthEye(gray, W, H, q);
+                        if (p4 && attempt([q[0], q[1], p4, q[3]])) return out;
+                    }
+                }
+                return out;
+            }
+
+            return {
+                draw: draw,
+                scan: scan,
+                encodeBits: encodeBits,
+                decodeBits: decodeBits,
+                EAR_RATIO: EAR_H / SPAN,
+                MAX_ID: MAX_ID,
+                _rs: { encode: rsEncode, decode: rsDecode },
+                _pos: POS
+            };
+        })();
+    </script>
+
+    <script>
+        var versaoLocalSite = "0.54";
         var defaultCover = "https://zarafm.xyz/zaralogo.png?v=3";
         var globalCipher = null; 
         
-        var earPalette = ["#2d2d2d", "#ffffff", "#ff6b6b", "#4cd7d0", "#3b82f6", "#a855f7", "#facc15", "#22c55e"];
-
-        // A color that never appears in earPalette, the card background, or
-        // the brand's pink/brown — used only for the 4 corner tracking dots
-        // (position, not data). This is what lets the scanner find, rotate,
-        // and scale the ear zone in an arbitrary photo, the same job a real
-        // QR's 3 corner "eye" patterns do.
-        var FIDUCIAL_HEX = '#ff00e5';
-        var FIDUCIAL_RGB = { r: 255, g: 0, b: 229 };
-
-        // Bounding rectangle around the 5 ears, in the card's own 300x480
-        // space. The 4 tracking dots sit exactly at its corners — this
-        // object is the single shared source of truth for both drawing them
-        // (buildEarCard) and locating them later (tryDecodeEarFromCanvas), so
-        // the two can't drift out of sync the way the old geometry did.
-        var EAR_ZONE = { x0: 14, y0: 300, x1: 288, y1: 414 };
-
-        function computeZaraChecksum(idDigits) {
-            var sum = 0;
-            for (var i = 0; i < idDigits.length; i++) sum += idDigits[i] * (i + 3);
-            return sum % 512;
-        }
-
-        function encodeTrackId(trackId) {
-            var idDigits = [];
-            var n = trackId;
-            for (var i = 0; i < 12; i++) { idDigits.push(n % 8); n = Math.floor(n / 8); }
-            var checksum = computeZaraChecksum(idDigits);
-            var checksumDigits = [];
-            for (var i = 0; i < 3; i++) { checksumDigits.push(checksum % 8); checksum = Math.floor(checksum / 8); }
-            return idDigits.concat(checksumDigits);
-        }
-
-        function digitsToNumber(digits) {
-            var value = 0;
-            for (var i = digits.length - 1; i >= 0; i--) value = value * 8 + digits[i];
-            return value;
-        }
-
-        function decodeZaraCode(indices) {
-            var idDigits = indices.slice(0, 12);
-            var checksumDigits = indices.slice(12, 15);
-            var readChecksum = digitsToNumber(checksumDigits);
-            var expectedChecksum = computeZaraChecksum(idDigits);
-            if (readChecksum !== expectedChecksum) return null;
-            return digitsToNumber(idDigits);
-        }
-
-        // The 15 sample points (5 ears x [left-half, right-half, accent dot]),
-        // expressed as fractions (u,v) of EAR_ZONE. Normalized coordinates
-        // let us re-map every point through whatever homography the 4
-        // tracking dots produce, regardless of the photo's scale/rotation.
-        function buildEarSamplePointsNormalized() {
-            var startX = 22, startY = 320, earW = 50, earH = 80, gap = 4;
-            var baseY = startY + earH;
-            var points = [];
-            for (var i = 0; i < 5; i++) {
-                var x = startX + i * (earW + gap);
-                points.push({ x: x + 14, y: baseY - 8 });
-                points.push({ x: x + 36, y: baseY - 8 });
-                points.push({ x: x + 25, y: baseY - 24 });
-            }
-            return points.map(function(p) {
-                return {
-                    u: (p.x - EAR_ZONE.x0) / (EAR_ZONE.x1 - EAR_ZONE.x0),
-                    v: (p.y - EAR_ZONE.y0) / (EAR_ZONE.y1 - EAR_ZONE.y0)
-                };
-            });
-        }
-        var EAR_SAMPLE_POINTS_NORM = buildEarSamplePointsNormalized();
-
         function makeRoundRectPath(ctx, x, y, width, height, radius) {
             ctx.beginPath(); 
             ctx.moveTo(x + radius, y); 
@@ -642,6 +1269,7 @@
                 fetch('https://itunes.apple.com/search?term=' + encodeURIComponent(current) + '&entity=song&limit=1')
                     .then(function(res) { return res.json(); })
                     .then(function(data) {
+                        if (earTrack) return; // a pessoa já escolheu outra música
                         if (data.results && data.results.length) {
                             var t = data.results[0];
                             buildEarCard(t.trackName, t.artistName, t.artworkUrl100.replace('100x100bb', '200x200bb'), t.trackId);
@@ -655,137 +1283,91 @@
             }
         }
 
-        function showEarPlaceholder() {
+        // Card em 3x (900x1680 px) para o PNG baixado sair nítido;
+        // as coordenadas abaixo são lógicas (300x560).
+        var EAR_CARD_W = 300, EAR_CARD_H = 560, EAR_CARD_SCALE = 3;
+        var earRenderToken = 0;
+
+        function prepareEarCanvas() {
             var canvas = document.getElementById('earCanvas');
+            canvas.width = EAR_CARD_W * EAR_CARD_SCALE;
+            canvas.height = EAR_CARD_H * EAR_CARD_SCALE;
             var ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, 300, 480);
+            ctx.setTransform(EAR_CARD_SCALE, 0, 0, EAR_CARD_SCALE, 0, 0);
+            ctx.clearRect(0, 0, EAR_CARD_W, EAR_CARD_H);
             ctx.fillStyle = '#efa39a';
-            roundRect(ctx, 0, 0, 300, 480, 24);
+            roundRect(ctx, 0, 0, EAR_CARD_W, EAR_CARD_H, 24);
             ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 2; ctx.stroke();
+            return ctx;
+        }
+
+        function showEarPlaceholder() {
+            earRenderToken++;
+            var ctx = prepareEarCanvas();
             ctx.fillStyle = '#462c26'; ctx.textAlign = 'center';
             ctx.font = 'bold 16px "Fredoka", sans-serif';
-            ctx.fillText('Busque uma música 🔍', 150, 235);
+            ctx.fillText('Busque uma música 🔍', 150, 270);
             ctx.font = '13px "Fredoka", sans-serif'; ctx.globalAlpha = 0.75;
-            ctx.fillText('para gerar o ZaraCode', 150, 258);
+            ctx.fillText('para gerar o ZaraCode', 150, 293);
             ctx.globalAlpha = 1.0;
             document.getElementById('downloadEarBtn').style.display = 'none';
         }
 
         function buildEarCard(title, artist, coverUrl, trackId) {
-            // *** THE REAL FIX ***
-            // Keeps the full-color ears (not turning them into a monochrome
-            // QR). What was actually missing wasn't color — it was a way for
-            // a scanner to *find* the ear region in an arbitrary photo. A
-            // real QR solves that with 3 corner "eye" patterns it searches
-            // for at any scale/rotation. We do the same trick here with 4
-            // small tracking dots in a color that never appears anywhere
-            // else on the card. The scanner locates all 4, computes the
-            // perspective transform between them and their known positions,
-            // and uses that to find each ear's exact pixel — regardless of
-            // camera angle, distance, or rotation. The ears themselves are
-            // untouched: still 8 colors, still hand-drawn.
-            var colorIndices = encodeTrackId(trackId);
-
-            var canvas = document.getElementById('earCanvas');
-            var ctx = canvas.getContext('2d');
-            
-            ctx.fillStyle = '#efa39a';
-            roundRect(ctx, 0, 0, 300, 480, 24);
-            ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 2; ctx.stroke();
-
+            var token = ++earRenderToken;
             var img = new Image();
             img.crossOrigin = "anonymous";
-            img.onload = function() {
-                ctx.save(); 
-                makeRoundRectPath(ctx, 30, 25, 240, 210, 16); 
+            img.onload = function() { if (token === earRenderToken) drawEarCard(title, artist, img, trackId); };
+            img.onerror = function() { if (token === earRenderToken) drawEarCard(title, artist, null, trackId); };
+            // capa em resolução maior (o card é exportado em 3x)
+            img.src = String(coverUrl).replace(/\/\d+x\d+bb\./, '/600x600bb.');
+        }
+
+        function drawEarCard(title, artist, coverImg, trackId) {
+            var ctx = prepareEarCanvas();
+            var cx = 75, cy = 22, cs = 150;
+
+            ctx.save();
+            ctx.shadowColor = 'rgba(70,44,38,0.3)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 6;
+            ctx.fillStyle = '#462c26';
+            roundRect(ctx, cx, cy, cs, cs, 16);
+            ctx.restore();
+            if (coverImg) {
+                ctx.save();
+                makeRoundRectPath(ctx, cx, cy, cs, cs, 16);
                 ctx.clip();
-                ctx.drawImage(img, 30, 25, 240, 210); 
+                ctx.drawImage(coverImg, cx, cy, cs, cs);
                 ctx.restore();
-                drawStyledCatEars(colorIndices, title, artist);
-            };
-            img.onerror = function() { drawStyledCatEars(colorIndices, title, artist); };
-            img.src = coverUrl;
-
-            function drawStyledCatEars(colors, t, a) {
-                ctx.fillStyle = '#462c26'; ctx.textAlign = 'center';
-                ctx.font = 'bold 20px "Fredoka", sans-serif';
-                ctx.fillText(t.length > 22 ? t.substring(0, 20) + "..." : t, 150, 265);
-                ctx.font = '14px "Fredoka", sans-serif'; ctx.globalAlpha = 0.8;
-                ctx.fillText(a.length > 28 ? a.substring(0, 25) + "..." : a, 150, 288);
-                ctx.globalAlpha = 1.0;
-
-                // Layout constants — buildEarSamplePointsNormalized() above
-                // derives its sample points from these same numbers, so if
-                // you ever tweak the geometry here, that's the only other
-                // place it needs to match.
-                var startX = 22, startY = 320, earW = 50, earH = 80, gap = 4;
-                var tipY = startY - 6, baseY = startY + earH;
-
-                for (var i = 0; i < 5; i++) {
-                    var x = startX + (i * (earW + gap));
-                    var l = colors[i * 3], r = colors[(i * 3) + 1], b = colors[(i * 3) + 2];
-                    var cx = x + earW / 2;
-
-                    var earPath = (function(x, cx) { return function() {
-                        ctx.beginPath();
-                        ctx.moveTo(x + 6, baseY);
-                        ctx.quadraticCurveTo(x - 4, startY + earH * 0.4, cx, tipY);
-                        ctx.quadraticCurveTo(x + earW + 4, startY + earH * 0.4, x + earW - 6, baseY);
-                        ctx.closePath();
-                    }; })(x, cx);
-
-                    // One clean silhouette split into two big, unambiguous
-                    // solid halves (l, r) instead of three overlapping
-                    // hand-drawn shapes — easier to read back reliably.
-                    ctx.save();
-                    earPath();
-                    ctx.clip();
-
-                    ctx.fillStyle = earPalette[l];
-                    ctx.fillRect(x - 10, tipY - 10, (earW / 2) + 10, earH + 20);
-                    ctx.fillStyle = earPalette[r];
-                    ctx.fillRect(cx, tipY - 10, (earW / 2) + 10, earH + 20);
-
-                    // Soft glossy highlight near the tip, purely cosmetic.
-                    ctx.beginPath();
-                    ctx.ellipse(cx, tipY + 20, 7, 13, -0.35, 0, Math.PI * 2);
-                    ctx.fillStyle = 'rgba(255,255,255,0.28)';
-                    ctx.fill();
-                    ctx.restore();
-
-                    earPath();
-                    ctx.strokeStyle = '#462c26'; ctx.lineWidth = 2.5;
-                    ctx.stroke();
-
-                    // Third data value (b) as a small solid accent dot,
-                    // kept well clear of the sample zone above it.
-                    ctx.beginPath();
-                    ctx.arc(cx, baseY - 24, 6, 0, Math.PI * 2);
-                    ctx.fillStyle = earPalette[b];
-                    ctx.fill();
-                    ctx.strokeStyle = '#462c26'; ctx.lineWidth = 1.5;
-                    ctx.stroke();
-                }
-
-                // The 4 fiducial tracking dots — position only, no data.
-                // White halo first for contrast against any background.
-                [[EAR_ZONE.x0, EAR_ZONE.y0], [EAR_ZONE.x1, EAR_ZONE.y0],
-                 [EAR_ZONE.x1, EAR_ZONE.y1], [EAR_ZONE.x0, EAR_ZONE.y1]].forEach(function(pt) {
-                    ctx.beginPath();
-                    ctx.arc(pt[0], pt[1], 10, 0, Math.PI * 2);
-                    ctx.fillStyle = '#ffffff';
-                    ctx.fill();
-                    ctx.beginPath();
-                    ctx.arc(pt[0], pt[1], 7, 0, Math.PI * 2);
-                    ctx.fillStyle = FIDUCIAL_HEX;
-                    ctx.fill();
-                });
-
-                ctx.font = 'bold 12px "Fredoka", sans-serif'; ctx.fillStyle = '#462c26'; ctx.globalAlpha = 0.6;
-                ctx.fillText("🐾 ZARACODE • EXCLUSIVE", 150, 452); ctx.globalAlpha = 1.0;
-
-                document.getElementById('downloadEarBtn').style.display = 'flex';
+            } else {
+                ctx.font = '48px sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = '#f7cac9';
+                ctx.fillText('🎵', 150, 115);
             }
+
+            ctx.fillStyle = '#462c26'; ctx.textAlign = 'center';
+            ctx.font = 'bold 19px "Fredoka", sans-serif';
+            ctx.fillText(title.length > 24 ? title.substring(0, 22) + "…" : title, 150, 200);
+            ctx.font = '14px "Fredoka", sans-serif'; ctx.globalAlpha = 0.8;
+            ctx.fillText(artist.length > 30 ? artist.substring(0, 28) + "…" : artist, 150, 221);
+            ctx.globalAlpha = 1.0;
+
+            // O código em si (painel com orelhas). Tudo o que o leitor
+            // precisa está dentro do painel branco.
+            var size = 236, left = (EAR_CARD_W - size) / 2;
+            var top = 240 + size * ZaraCode.EAR_RATIO;
+            try {
+                ZaraCode.draw(ctx, left, top, size, trackId);
+            } catch (e) {
+                ctx.font = 'bold 14px "Fredoka", sans-serif'; ctx.fillStyle = '#462c26';
+                ctx.fillText('Não deu para gerar o código 😿', 150, 400);
+                document.getElementById('downloadEarBtn').style.display = 'none';
+                return;
+            }
+
+            ctx.font = 'bold 11px "Fredoka", sans-serif'; ctx.fillStyle = '#462c26'; ctx.globalAlpha = 0.6;
+            ctx.fillText("🐾 ZARACODE • ESCANEIE NA ZARA FM", 150, 545);
+            ctx.globalAlpha = 1.0;
+
+            document.getElementById('downloadEarBtn').style.display = 'flex';
         }
 
         document.getElementById('earCodeBtn').addEventListener('click', function() {
@@ -814,7 +1396,7 @@
             var isEar = mode === 'ear';
             document.getElementById('scannerModalTitle').innerText = isEar ? '📷 Ler ZaraCode' : '📷 Ler Fluffytag';
             document.getElementById('scannerModalText').innerText = isEar
-                ? 'A leitura é automática: mostre o card com os 4 pontinhos dos cantos visíveis e bem iluminados.'
+                ? 'Toque em "Usar Câmera" e aponte para o ZaraCode — a leitura é automática, em qualquer ângulo. Ou envie uma foto.'
                 : 'Toque em "Usar Câmera" e aponte para o QR — a leitura é automática. Ou envie uma foto.';
             document.getElementById('scannerModal').style.display = 'flex';
         }
@@ -838,10 +1420,21 @@
                 alert('Seu navegador não suporta acesso à câmera. Envie uma foto.');
                 return;
             }
+            var isEar = currentScanMode === 'ear';
             navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+                video: isEar
+                    ? { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+                    : { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
             }).then(function(stream) {
                 cameraStream = stream;
+                // Foco contínuo quando o aparelho permite (Android/Chrome).
+                try {
+                    var track = stream.getVideoTracks()[0];
+                    var caps = track.getCapabilities ? track.getCapabilities() : {};
+                    if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) {
+                        track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(function() {});
+                    }
+                } catch (e) { }
                 var video = document.getElementById('scannerVideo');
                 video.srcObject = stream;
                 document.getElementById('scannerVideoWrap').style.display = 'block';
@@ -849,9 +1442,11 @@
 
                 video.onloadedmetadata = function() {
                     if (currentScanMode === 'ear') {
-                        // Fiducial-marker detection: locate the 4 tracking
-                        // dots anywhere in frame, at any angle/rotation.
-                        cameraScanInterval = setInterval(scanEarFrame, 350);
+                        earLoopActive = true;
+                        earFrameCount = 0;
+                        earHintHistory = [];
+                        setScannerHint('Procurando o ZaraCode… 🔍');
+                        scanEarFrame();
                     } else {
                         // Real QR: jsQR auto-detects position/rotation/scale.
                         cameraScanInterval = setInterval(scanQrFrame, 300);
@@ -864,6 +1459,8 @@
 
         function stopCamera() {
             if (cameraScanInterval) { clearInterval(cameraScanInterval); cameraScanInterval = null; }
+            earLoopActive = false;
+            if (earLoopTimer) { clearTimeout(earLoopTimer); earLoopTimer = null; }
             if (cameraStream) {
                 cameraStream.getTracks().forEach(function(track) { track.stop(); });
                 cameraStream = null;
@@ -871,6 +1468,9 @@
             var video = document.getElementById('scannerVideo');
             video.onloadedmetadata = null;
             video.srcObject = null;
+            var ov = document.getElementById('scannerOverlay');
+            ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
+            setScannerHint('');
             document.getElementById('scannerVideoWrap').style.display = 'none';
             document.getElementById('toggleCameraBtn').innerText = '📷 Usar Câmera';
         }
@@ -906,214 +1506,101 @@
             tratarDadosLeitura(match[1]);
         }
 
-        // --- DETECÇÃO DO ZARACODE POR MARCADORES (câmera ou foto) ---
-        // No QR involved here. This finds the 4 fiducial dots by color,
-        // computes the perspective transform (homography) between their
-        // known positions and where they actually landed in the photo, and
-        // uses that to map every ear sample point precisely — regardless of
-        // how the card is rotated, tilted, or how far away it is.
+        // --- LEITURA DO ZARACODE PELA CÂMERA ---
+        // Cada quadro passa pelo ZaraCode.scan(): acha os 4 olhos, corrige a
+        // perspectiva, lê os 88 pontinhos e confere com o Reed-Solomon.
+        // Alterna duas resoluções: uma rápida (código perto) e uma mais
+        // detalhada (código pequeno / longe).
+        var earLoopActive = false, earLoopTimer = null, earFrameCount = 0, earHintHistory = [];
 
-        function colorDistSq(r, g, b, ref) {
-            var dr = r - ref.r, dg = g - ref.g, db = b - ref.b;
-            return dr * dr + dg * dg + db * db;
-        }
-
-        function findFiducialBlobs(imgData, W, H) {
-            var visited = new Uint8Array(W * H);
-            var blobs = [];
-            var data = imgData.data;
-            var TOLERANCE = 4200;
-
-            function isMarkerPixel(idx) {
-                var i = idx * 4;
-                return colorDistSq(data[i], data[i + 1], data[i + 2], FIDUCIAL_RGB) < TOLERANCE;
-            }
-
-            for (var y = 0; y < H; y++) {
-                for (var x = 0; x < W; x++) {
-                    var idx = y * W + x;
-                    if (visited[idx] || !isMarkerPixel(idx)) continue;
-
-                    var stack = [idx];
-                    visited[idx] = 1;
-                    var sumX = 0, sumY = 0, count = 0;
-                    var minX = x, maxX = x, minY = y, maxY = y;
-
-                    while (stack.length) {
-                        var cur = stack.pop();
-                        var cx = cur % W, cy = (cur / W) | 0;
-                        sumX += cx; sumY += cy; count++;
-                        if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
-                        if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
-
-                        var left = cur - 1, right = cur + 1, up = cur - W, down = cur + W;
-                        var candidates = [
-                            (cx > 0) ? left : -1,
-                            (cx < W - 1) ? right : -1,
-                            up, down
-                        ];
-                        for (var n = 0; n < 4; n++) {
-                            var nb = candidates[n];
-                            if (nb < 0 || nb >= W * H || visited[nb]) continue;
-                            if (isMarkerPixel(nb)) { visited[nb] = 1; stack.push(nb); }
-                            else visited[nb] = 1;
-                        }
-                    }
-
-                    if (count >= 12) {
-                        blobs.push({ x: sumX / count, y: sumY / count, count: count, w: maxX - minX + 1, h: maxY - minY + 1 });
-                    }
-                }
-            }
-            return blobs;
-        }
-
-        function pickFourCorners(blobs) {
-            if (blobs.length < 4) return null;
-            var candidates = blobs.filter(function(b) {
-                var ratio = b.w / b.h;
-                return ratio > 0.35 && ratio < 2.8;
-            });
-            if (candidates.length < 4) candidates = blobs;
-
-            candidates.sort(function(a, b) { return b.count - a.count; });
-            var four = candidates.slice(0, 4);
-            if (four.length < 4) return null;
-
-            var tl = four[0], tr = four[0], bl = four[0], br = four[0];
-            var minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
-            four.forEach(function(p) {
-                var sum = p.x + p.y, diff = p.x - p.y;
-                if (sum < minSum) { minSum = sum; tl = p; }
-                if (sum > maxSum) { maxSum = sum; br = p; }
-                if (diff > maxDiff) { maxDiff = diff; tr = p; }
-                if (diff < minDiff) { minDiff = diff; bl = p; }
-            });
-            return { tl: tl, tr: tr, br: br, bl: bl };
-        }
-
-        function solveLinearSystem(A, b) {
-            var n = b.length;
-            for (var i = 0; i < n; i++) A[i].push(b[i]);
-            for (var col = 0; col < n; col++) {
-                var maxRow = col;
-                for (var r = col + 1; r < n; r++) {
-                    if (Math.abs(A[r][col]) > Math.abs(A[maxRow][col])) maxRow = r;
-                }
-                var tmp = A[col]; A[col] = A[maxRow]; A[maxRow] = tmp;
-                if (Math.abs(A[col][col]) < 1e-10) return null;
-                for (var r2 = 0; r2 < n; r2++) {
-                    if (r2 === col) continue;
-                    var factor = A[r2][col] / A[col][col];
-                    for (var c = col; c <= n; c++) A[r2][c] -= factor * A[col][c];
-                }
-            }
-            var x = [];
-            for (var i2 = 0; i2 < n; i2++) x.push(A[i2][n] / A[i2][i2]);
-            return x;
-        }
-
-        function computeHomography(src, dst) {
-            var A = [], b = [];
-            for (var i = 0; i < 4; i++) {
-                var x = src[i].x, y = src[i].y, xp = dst[i].x, yp = dst[i].y;
-                A.push([x, y, 1, 0, 0, 0, -x * xp, -y * xp]); b.push(xp);
-                A.push([0, 0, 0, x, y, 1, -x * yp, -y * yp]); b.push(yp);
-            }
-            var h = solveLinearSystem(A, b);
-            if (!h) return null;
-            return { h11: h[0], h12: h[1], h13: h[2], h21: h[3], h22: h[4], h23: h[5], h31: h[6], h32: h[7] };
-        }
-
-        function applyHomography(H, x, y) {
-            var denom = H.h31 * x + H.h32 * y + 1;
-            return { x: (H.h11 * x + H.h12 * y + H.h13) / denom, y: (H.h21 * x + H.h22 * y + H.h23) / denom };
-        }
-
-        function getClosestColorIndex(r, g, b) {
-            var minDist = Infinity, bestIdx = -1;
-            for (var i = 0; i < earPalette.length; i++) {
-                var hex = earPalette[i];
-                var pr = parseInt(hex.slice(1, 3), 16), pg = parseInt(hex.slice(3, 5), 16), pb = parseInt(hex.slice(5, 7), 16);
-                var rmean = (r + pr) / 2, dr = r - pr, dg = g - pg, db = b - pb;
-                var dist = ((2 + rmean / 256) * dr * dr) + (4 * dg * dg) + ((2 + (255 - rmean) / 256) * db * db);
-                if (dist < minDist) { minDist = dist; bestIdx = i; }
-            }
-            if (minDist > 12000) return -1; // amostra longe demais de qualquer cor conhecida
-            return bestIdx;
-        }
-
-        function getSampleIndexAt(data, W, H, cx, cy) {
-            var r = 0, g = 0, b = 0, n = 0;
-            var radius = 3;
-            for (var dy = -radius; dy <= radius; dy++) {
-                for (var dx = -radius; dx <= radius; dx++) {
-                    var px = Math.round(cx + dx), py = Math.round(cy + dy);
-                    if (px >= 0 && px < W && py >= 0 && py < H) {
-                        var i = (py * W + px) * 4;
-                        r += data[i]; g += data[i + 1]; b += data[i + 2]; n++;
-                    }
-                }
-            }
-            if (!n) return -1;
-            return getClosestColorIndex(r / n, g / n, b / n);
+        function setScannerHint(text) {
+            var el = document.getElementById('scannerHint');
+            if (el.innerText !== text) el.innerText = text;
         }
 
         function scanEarFrame() {
+            earLoopTimer = null;
+            if (!earLoopActive) return;
             var video = document.getElementById('scannerVideo');
-            if (!video.videoWidth) return;
-            // Downscale for speed — marker centroids/homography don't need
-            // full resolution, and this keeps blob detection fast per frame.
-            var scale = Math.min(1, 480 / video.videoWidth);
-            var w = Math.round(video.videoWidth * scale), h = Math.round(video.videoHeight * scale);
-            var canvas = document.getElementById('scannerCaptureCanvas');
-            canvas.width = w; canvas.height = h;
-            var ctx = canvas.getContext('2d', { willReadFrequently: true });
-            ctx.drawImage(video, 0, 0, w, h);
-            tryDecodeEarFromCanvas(canvas, ctx, false);
+            var t0 = performance.now();
+            if (video.videoWidth && video.readyState >= 2) {
+                var vw = video.videoWidth, vh = video.videoHeight;
+                var maxDim = (earFrameCount++ % 2 === 0) ? 800 : 1280;
+                var scale = Math.min(1, maxDim / Math.max(vw, vh));
+                var w = Math.round(vw * scale), h = Math.round(vh * scale);
+                var canvas = document.getElementById('scannerCaptureCanvas');
+                if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+                var ctx = canvas.getContext('2d', { willReadFrequently: true });
+                ctx.drawImage(video, 0, 0, w, h);
+                var res = ZaraCode.scan(ctx.getImageData(0, 0, w, h), { maxErrors: 2 });
+                drawScannerOverlay(res, vw, vh, 1 / scale);
+                if (res.id) {
+                    earLoopActive = false;
+                    setScannerHint('Li! 🎉');
+                    if (navigator.vibrate) navigator.vibrate(60);
+                    setTimeout(function() { closeScanner(); lookupTrackAndShow(res.id); }, 300);
+                    return;
+                }
+                updateEarHint(res);
+            }
+            earLoopTimer = setTimeout(scanEarFrame, Math.max(30, 140 - (performance.now() - t0)));
         }
 
-        function tryDecodeEarFromCanvas(canvas, ctx, isUpload) {
-            var W = canvas.width, H = canvas.height;
-            var imgData = ctx.getImageData(0, 0, W, H);
-
-            var blobs = findFiducialBlobs(imgData, W, H);
-            var corners = pickFourCorners(blobs);
-            if (!corners) {
-                if (isUpload) mostrarResultadoLeitura({ title: "Não encontrei os 4 marcadores 😿", artist: "Garanta que os 4 pontinhos coloridos dos cantos estejam visíveis e bem iluminados", cover: defaultCover });
-                return; // câmera: continua tentando silenciosamente
+        function drawScannerOverlay(res, vw, vh, k) {
+            var ov = document.getElementById('scannerOverlay');
+            if (ov.width !== vw || ov.height !== vh) { ov.width = vw; ov.height = vh; }
+            var g = ov.getContext('2d');
+            g.clearRect(0, 0, vw, vh);
+            var lw = Math.max(3, vw / 250);
+            var marks = res.id && res.quad ? res.quad : res.eyes.filter(function(e) { return e.n >= 2; });
+            marks.forEach(function(e) {
+                var r = (e.m ? e.m * 4.3 : res.quad[0].m * 4.3) * k;
+                g.beginPath();
+                g.arc(e.x * k, e.y * k, r, 0, Math.PI * 2);
+                g.lineWidth = lw;
+                g.strokeStyle = res.id ? '#22c55e' : '#ff4fa3';
+                g.stroke();
+            });
+            if (res.id && res.quad) {
+                g.beginPath();
+                res.quad.forEach(function(p, i) { if (i) g.lineTo(p.x * k, p.y * k); else g.moveTo(p.x * k, p.y * k); });
+                g.closePath();
+                g.lineWidth = lw * 1.5; g.strokeStyle = '#22c55e'; g.stroke();
             }
+        }
 
-            var H_matrix = computeHomography(
-                [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }],
-                [corners.tl, corners.tr, corners.br, corners.bl]
-            );
-            if (!H_matrix) {
-                if (isUpload) mostrarResultadoLeitura({ title: "Não consegui calcular a posição do card 😿", artist: "Tente novamente com o card mais reto em relação à câmera", cover: defaultCover });
-                return;
+        function updateEarHint(res) {
+            // Usa o melhor dos últimos quadros para o texto não ficar piscando.
+            earHintHistory.push(res.eyes.filter(function(e) { return e.n >= 2; }).length);
+            if (earHintHistory.length > 6) earHintHistory.shift();
+            var n = Math.max.apply(null, earHintHistory);
+            if (n < 3) setScannerHint('Procurando o ZaraCode… mostre o código inteiro 🔍');
+            else if (n === 3) setScannerHint('Vi 3 de 4 olhinhos — falta 1! Evite reflexo de luz 🐱');
+            else setScannerHint('Quase lá! Segura firme… 🐾');
+        }
+
+        // --- LEITURA DO ZARACODE POR FOTO ---
+        function decodeEarFromImage(img) {
+            var canvas = document.createElement('canvas');
+            var lastScale = -1, maxEyes = 0;
+            var sizes = [1000, 1600, 700];
+            for (var i = 0; i < sizes.length; i++) {
+                var scale = Math.min(1, sizes[i] / Math.max(img.naturalWidth, img.naturalHeight));
+                if (Math.abs(scale - lastScale) < 0.01) continue;
+                lastScale = scale;
+                canvas.width = Math.round(img.naturalWidth * scale);
+                canvas.height = Math.round(img.naturalHeight * scale);
+                var ctx = canvas.getContext('2d', { willReadFrequently: true });
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                var res = ZaraCode.scan(ctx.getImageData(0, 0, canvas.width, canvas.height), { maxErrors: 3 });
+                if (res.id) { closeScanner(); lookupTrackAndShow(res.id); return; }
+                maxEyes = Math.max(maxEyes, res.eyes.filter(function(e) { return e.n >= 2; }).length);
             }
-
-            var indices = [], failed = 0, data = imgData.data;
-            for (var i = 0; i < EAR_SAMPLE_POINTS_NORM.length; i++) {
-                var p = applyHomography(H_matrix, EAR_SAMPLE_POINTS_NORM[i].u, EAR_SAMPLE_POINTS_NORM[i].v);
-                var idx = getSampleIndexAt(data, W, H, p.x, p.y);
-                if (idx === -1) { failed++; idx = 0; }
-                indices.push(idx);
+            if (maxEyes < 3) {
+                mostrarResultadoLeitura({ title: "Não encontrei o ZaraCode 😿", artist: "Envie uma foto com o código inteiro (os 4 olhinhos dos cantos), de perto e sem reflexo", cover: defaultCover });
+            } else {
+                mostrarResultadoLeitura({ title: "Achei o ZaraCode, mas não consegui ler 😿", artist: "Tente uma foto mais nítida, mais de perto e sem reflexo de luz em cima", cover: defaultCover });
             }
-
-            if (failed > 4) {
-                if (isUpload) mostrarResultadoLeitura({ title: "Não consegui ler esse código 😿", artist: "Aproxime um pouco mais e tente de novo, com boa luz", cover: defaultCover });
-                return;
-            }
-
-            var trackId = decodeZaraCode(indices);
-            if (trackId === null) {
-                if (isUpload) mostrarResultadoLeitura({ title: "Não consegui ler esse código 😿", artist: "Tente um ângulo ou distância diferente, com boa luz", cover: defaultCover });
-                return; // câmera: continua tentando silenciosamente
-            }
-
-            closeScanner();
-            lookupTrackAndShow(trackId);
         }
 
         function tratarDadosLeitura(param) {
@@ -1183,14 +1670,7 @@
                         ctx.drawImage(img, 0, 0);
                         tryDecodeQrFromCanvas(canvas, ctx, true);
                     } else {
-                        // Mesmo pipeline de marcadores usado pela câmera —
-                        // reduzido a uma largura razoável só por desempenho.
-                        var scale = Math.min(1, 900 / img.naturalWidth);
-                        canvas.width = Math.round(img.naturalWidth * scale);
-                        canvas.height = Math.round(img.naturalHeight * scale);
-                        ctx = canvas.getContext('2d', { willReadFrequently: true });
-                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                        tryDecodeEarFromCanvas(canvas, ctx, true);
+                        decodeEarFromImage(img);
                     }
                     document.getElementById('scannerFileInput').value = "";
                 };
